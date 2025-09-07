@@ -1,0 +1,10 @@
+{
+    "cityName": "Pécs",
+    "gtfsPath": "gtfs_pea.zip",
+    "simDate": "20210916",
+    "transportModes": "bus",
+    "maxJobs": 7,
+    "centerX": 9619.87,
+    "centerY": 10540.2,
+    "simsPerValue": 10
+  }
