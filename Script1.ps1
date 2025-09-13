@@ -12,13 +12,12 @@ function Test-Command([string]$name) {
 
 function Get-PythonCommand {
     if ($env:PYTHON) { return $env:PYTHON }
-    if (Test-Command python3) { return 'python3' }
-    if (Test-Command python) { return 'python' }
-    # Try common user installation paths
-    $local = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs\Python" -Filter "Python3*" -Directory -ErrorAction SilentlyContinue | \ 
-        Get-ChildItem -Filter python.exe -File -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($local) { return $local.FullName }
     if (Test-Command py) { return 'py' }
+    if (Test-Command python3) { return 'python3' }
+    # Try common user installation paths first to avoid Windows Store alias
+    $local = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs\Python" -Filter "Python3*" -Directory -ErrorAction SilentlyContinue | Get-ChildItem -Filter python.exe -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($local) { return $local.FullName }
+    if (Test-Command python) { return 'python' }
     throw "Python not found. Please install Python 3 and ensure it is in PATH, or set $env:PYTHON."
 }
 
@@ -120,12 +119,18 @@ function Get-UserInput {
         do { $Global:CITY_NAME = Read-Host "Enter the city name (e.g., Budapest, Pecs)" } while ([string]::IsNullOrWhiteSpace($Global:CITY_NAME))
     } else { Write-Info ("City: {0}" -f $Global:CITY_NAME) }
 
-    if (-not (Test-Path $Global:GTFS_PATH)) {
+    if ([string]::IsNullOrWhiteSpace($Global:GTFS_PATH)) {
         do {
             $Global:GTFS_PATH = Read-Host "Enter the path to GTFS zip file"
             if (-not (Test-Path $Global:GTFS_PATH)) { Write-Warn "GTFS file not found: $Global:GTFS_PATH" }
         } while (-not (Test-Path $Global:GTFS_PATH))
-    } else { Write-Info ("GTFS: {0}" -f $Global:GTFS_PATH) }
+    } else {
+        Write-Info ("GTFS: {0}" -f $Global:GTFS_PATH)
+        if (-not (Test-Path $Global:GTFS_PATH)) {
+            Write-Err "GTFS file not found at path from config.json: $Global:GTFS_PATH"
+            throw "GTFS path invalid"
+        }
+    }
     try { $Global:GTFS_PATH_ABS = (Resolve-Path $Global:GTFS_PATH).Path } catch { Write-Err "Could not resolve GTFS path: $Global:GTFS_PATH"; throw }
     Write-Info ("Resolved GTFS path: {0}" -f $Global:GTFS_PATH_ABS)
 
@@ -168,7 +173,7 @@ function Create-PythonScripts {
 import argparse
 import requests
 
-sumo-automation/1.0 (contact: exemple@exemple.com)", "Accept-Language": "en"}HEADERS = {"User-Agent": "
+HEADERS = {"User-Agent": "sumo-automation/1.0 (contact: exemple@exemple.com)", "Accept-Language": "en"}
 
 def get_bbox(city_name: str):
     url = "https://nominatim.openstreetmap.org/search"
@@ -356,10 +361,10 @@ function Run-Workflow {
     } else {
         Write-Info "Processing GTFS data..."
         Push-Location $OUT_GTFS
-        & $pythonCmd $Global:GTFS2PT -n $netFile --gtfs $Global:GTFS_PATH_ABS --date $SIM_DATE --modes $TRANSPORT_MODES `
-            --vtype-output $vtypes `
-            --route-output $gtfsRou `
-            --additional-output $gtfsAdd
+        & $pythonCmd $Global:GTFS2PT -n "$netFile" --gtfs "$Global:GTFS_PATH_ABS" --date $SIM_DATE --modes "$TRANSPORT_MODES" `
+            --vtype-output "$vtypes" `
+            --route-output "$gtfsRou" `
+            --additional-output "$gtfsAdd"
         Pop-Location
         if (-not ((Test-Path $vtypes) -and (Test-Path $gtfsRou) -and (Test-Path $gtfsAdd))) { Write-Err "Failed to create GTFS outputs"; throw "gtfs failed" }
         Write-Success "GTFS processing completed successfully"
@@ -376,7 +381,7 @@ function Run-Simulations {
     $BASE_SEED = 12345
     $VALUES = @()
     for ($v=1000; $v -le 33000; $v+=1000) { $VALUES += $v }
-    for ($v=36000; $v -le 64000; $v+=2000) { $VALUES += $v }
+    for ($v=36000; $v -le 58000; $v+=2000) { $VALUES += $v }
 
     $odVarDir = Join-Path $SimDir "od_variants"
     New-Item -Path $odVarDir -ItemType Directory -Force | Out-Null
@@ -406,14 +411,14 @@ function Run-Simulations {
 
                 Write-Host "[INFO] Starting simulation #$sim for value=$value, seed=$SEED" -ForegroundColor Cyan
 
-                od2trips --taz-files $ZonesTaz --od-matrix-files $odFile --seed $SEED -o $tripFile 2>&1 | Write-Host
+                od2trips --taz-files "$ZonesTaz" --od-matrix-files "$odFile" --seed $SEED -o "$tripFile" 2>&1 | Write-Host
                 if ($LASTEXITCODE -ne 0) { throw "od2trips failed for value=$value sim=$sim" }
 
-                duarouter -n $NetFile --route-files $tripFile --seed $SEED -o $routeFile --ignore-errors --repair 2>&1 | Write-Host
+                duarouter -n "$NetFile" --route-files "$tripFile" --seed $SEED -o "$routeFile" --ignore-errors --repair 2>&1 | Write-Host
                 if ($LASTEXITCODE -ne 0) { throw "duarouter failed for value=$value sim=$sim" }
 
-                sumo -n $NetFile --additional "$GtfsVtypes,$GtfsAdd" --routes "$routeFile" `
-                     --begin 21600 --end 36000 --seed $SEED --tripinfo-output $simOutput --ignore-route-errors 2>&1 | Write-Host
+                sumo -n "$NetFile" --additional "$GtfsVtypes,$GtfsAdd" --routes "$routeFile" `
+                     --begin 21600 --end 36000 --seed $SEED --tripinfo-output "$simOutput" --ignore-route-errors 2>&1 | Write-Host
                 if ($LASTEXITCODE -ne 0) { throw "sumo failed for value=$value sim=$sim" }
 
                 Write-Host "[SUCCESS] Completed: value=$value sim=$sim" -ForegroundColor Green
@@ -431,17 +436,16 @@ function Run-Simulations {
                 }
             }
         }
-        while (@($jobs).Count -gt 0) {
-            $done = Wait-Job -Any $jobs
-            $done = @($done)
-            foreach ($j in $done) {
-                Receive-Job $j -ErrorAction Continue | Out-Host
-                if ($j.State -ne 'Completed') { Stop-Job $jobs | Out-Null; throw "A simulation job failed." }
-                Remove-Job $j
-                $jobs = @($jobs | Where-Object { $_.Id -ne $j.Id })
-            }
+    }
+    while (@($jobs).Count -gt 0) {
+        $done = Wait-Job -Any $jobs
+        $done = @($done)
+        foreach ($j in $done) {
+            Receive-Job $j -ErrorAction Continue | Out-Host
+            if ($j.State -ne 'Completed') { Stop-Job $jobs | Out-Null; throw "A simulation job failed." }
+            Remove-Job $j
+            $jobs = @($jobs | Where-Object { $_.Id -ne $j.Id })
         }
-        Write-Success ("Finished all {0} simulations for value={1}" -f $SIMS_PER_VALUE,$value)
     }
     Write-Success "All simulations for all values completed!"
 }
