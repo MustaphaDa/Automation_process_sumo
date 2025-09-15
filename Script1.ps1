@@ -37,7 +37,7 @@ function Ensure-RequestsInstalled([string]$pythonCmd) {
 
 function Ensure-GtfsDeps([string]$pythonCmd) {
     Write-Info "Checking Python packages for GTFS import (numpy, pandas, lxml, shapely, rtree, pyproj)..."
-    $modules = @('numpy','pandas','lxml','shapely','rtree','pyproj')
+    $modules = @('numpy','pandas','lxml','shapely','rtree','pyproj','openpyxl')
     $missing = @()
     foreach ($m in $modules) {
         try { & $pythonCmd -c "import $m" | Out-Null; $ok = ($LASTEXITCODE -eq 0) } catch { $ok = $false }
@@ -371,11 +371,11 @@ function Run-Workflow {
     }
 
     Write-Success "Preprocessing completed successfully!"
-    Run-Simulations -NetFile $netFile -ZonesTaz $tazFile -GtfsVtypes $vtypes -GtfsAdd $gtfsAdd -GtfsRou $gtfsRou -SimDir $OUT_SIM
+    Run-Simulations -PythonCmd $pythonCmd -NetFile $netFile -ZonesTaz $tazFile -GtfsVtypes $vtypes -GtfsAdd $gtfsAdd -GtfsRou $gtfsRou -SimDir $OUT_SIM
 }
 
 function Run-Simulations {
-    param([string]$NetFile, [string]$ZonesTaz, [string]$GtfsVtypes, [string]$GtfsAdd, [string]$GtfsRou, [string]$SimDir)
+    param([string]$PythonCmd, [string]$NetFile, [string]$ZonesTaz, [string]$GtfsVtypes, [string]$GtfsAdd, [string]$GtfsRou, [string]$SimDir)
     Write-Info "Starting simulation batch..."
 
     $BASE_SEED = 12345
@@ -397,17 +397,54 @@ function Run-Simulations {
     if (-not (Test-Path $NetFile)) { Write-Err "Network file not found: $NetFile"; throw "net file missing" }
 
     $jobs = @()
+
+    # Baseline jobs (public transport only, no private traffic)
+    for ($sim=1; $sim -le $SIMS_PER_VALUE; $sim++) {
+        $SEED = $BASE_SEED + $sim
+        $baselineStop = Join-Path $SimDir ("stop_events_baseline_${sim}.xml")
+        if (Test-Path $baselineStop) {
+            Write-Warn ("Baseline already exists, skipping: {0}" -f $baselineStop)
+            continue
+        }
+        $job = Start-Job -ScriptBlock {
+            param($sim,$SEED,$CITY_NAME,$NetFile,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$baselineStop)
+            $ErrorActionPreference = 'Continue'
+            Set-Location $SimDir
+            Write-Host "[INFO] Starting baseline simulation for sim=$sim, seed=$SEED" -ForegroundColor Cyan
+            sumo -n "$NetFile" --additional "$GtfsVtypes,$GtfsAdd" --routes "$GtfsRou" `
+                 --begin 21600 --end 36000 --seed $SEED --stop-output "$baselineStop" --ignore-route-errors 2>&1 | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "sumo baseline failed for sim=$sim" }
+            Write-Host "[SUCCESS] Baseline completed: sim=$sim" -ForegroundColor Green
+        } -ArgumentList $sim,$SEED,$CITY_NAME,$NetFile,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$baselineStop
+
+        $jobs += $job
+        if ($jobs.Count -ge $MAX_JOBS) {
+            $done = Wait-Job -Any $jobs
+            $done = @($done)
+            foreach ($j in $done) {
+                Receive-Job $j -ErrorAction Continue | Out-Host
+                if ($j.State -ne 'Completed') { Stop-Job $jobs | Out-Null; throw "A simulation job failed." }
+                Remove-Job $j
+                $jobs = @($jobs | Where-Object { $_.Id -ne $j.Id })
+            }
+        }
+    }
     foreach ($value in $VALUES) {
         for ($sim=1; $sim -le $SIMS_PER_VALUE; $sim++) {
             $SEED = $BASE_SEED + $sim + $value
+            $stopOutput = Join-Path $SimDir ("stop_events_${value}_${sim}.xml")
+            $simOutput  = Join-Path $SimDir ("4_${value}_${sim}_${CITY_NAME}_sim_output.xml")
+            if (Test-Path $simOutput) {
+                Write-Warn ("Sim output already exists, skipping: {0}" -f $simOutput)
+                continue
+            }
             $job = Start-Job -ScriptBlock {
-                param($value,$sim,$SEED,$CITY_NAME,$NetFile,$ZonesTaz,$GtfsVtypes,$GtfsAdd,$SimDir,$odVarDir)
+                param($value,$sim,$SEED,$CITY_NAME,$NetFile,$ZonesTaz,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$odVarDir,$stopOutput,$simOutput)
                 $ErrorActionPreference = 'Continue'
                 Set-Location $SimDir
                 $odFile = Join-Path $odVarDir ("private_${value}.od")
                 $tripFile = Join-Path $SimDir ("4_${value}_${sim}_private_for.trips.xml")
                 $routeFile = Join-Path $SimDir ("4_${value}_${sim}_private.rou.xml")
-                $simOutput = Join-Path $SimDir ("4_${value}_${sim}_${CITY_NAME}_sim_output.xml")
 
                 Write-Host "[INFO] Starting simulation #$sim for value=$value, seed=$SEED" -ForegroundColor Cyan
 
@@ -417,12 +454,13 @@ function Run-Simulations {
                 duarouter -n "$NetFile" --route-files "$tripFile" --seed $SEED -o "$routeFile" --ignore-errors --repair 2>&1 | Write-Host
                 if ($LASTEXITCODE -ne 0) { throw "duarouter failed for value=$value sim=$sim" }
 
-                sumo -n "$NetFile" --additional "$GtfsVtypes,$GtfsAdd" --routes "$routeFile" `
-                     --begin 21600 --end 36000 --seed $SEED --tripinfo-output "$simOutput" --ignore-route-errors 2>&1 | Write-Host
+                # Run mixed simulation: PT routes + private routes
+                sumo -n "$NetFile" --additional "$GtfsVtypes,$GtfsAdd" --routes "$GtfsRou,$routeFile" `
+                     --begin 21600 --end 36000 --seed $SEED --tripinfo-output "$simOutput" --stop-output "$stopOutput" --ignore-route-errors 2>&1 | Write-Host
                 if ($LASTEXITCODE -ne 0) { throw "sumo failed for value=$value sim=$sim" }
 
                 Write-Host "[SUCCESS] Completed: value=$value sim=$sim" -ForegroundColor Green
-            } -ArgumentList $value,$sim,$SEED,$CITY_NAME,$NetFile,$ZonesTaz,$GtfsVtypes,$GtfsAdd,$SimDir,$odVarDir
+            } -ArgumentList $value,$sim,$SEED,$CITY_NAME,$NetFile,$ZonesTaz,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$odVarDir,$stopOutput,$simOutput
 
             $jobs += $job
             if ($jobs.Count -ge $MAX_JOBS) {
@@ -448,6 +486,33 @@ function Run-Simulations {
         }
     }
     Write-Success "All simulations for all values completed!"
+
+    # Build Excel analysis automatically
+    try {
+        $OUT_ROOT = Split-Path -Parent $SimDir
+        $OUT_ANALYSIS = Join-Path $OUT_ROOT "analysis"
+        New-Item -ItemType Directory -Path $OUT_ANALYSIS -Force | Out-Null
+        $excelPath = Join-Path $OUT_ANALYSIS "pt_delay.xlsx"
+        if (Test-Path $excelPath) {
+            try {
+                Remove-Item -Path $excelPath -Force -ErrorAction Stop
+            } catch {
+                Write-Warn ("Existing Excel locked, writing to a new file. Details: {0}" -f $_.Exception.Message)
+                $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+                $excelPath = Join-Path $OUT_ANALYSIS ("pt_delay_{0}.xlsx" -f $ts)
+            }
+        }
+        $exportScript = Join-Path (Get-Location) "export_pt_delay_excel.py"
+        Write-Info ("Exporting delay analysis to: {0}" -f $excelPath)
+        & $PythonCmd $exportScript --simdir "$SimDir" --sims $SIMS_PER_VALUE --out "$excelPath" | Write-Host
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $excelPath)) {
+            Write-Success "Delay analysis Excel generated"
+        } else {
+            Write-Err ("Export failed (exit={0})." -f $LASTEXITCODE)
+        }
+    } catch {
+        Write-Warn ("Failed to export Excel: {0}" -f $_.Exception.Message)
+    }
 }
 
 function Main {
