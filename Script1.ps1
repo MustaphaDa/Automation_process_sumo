@@ -177,7 +177,7 @@ HEADERS = {"User-Agent": "sumo-automation/1.0 (contact: exemple@exemple.com)", "
 
 def get_bbox(city_name: str):
     url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": city_name, "format": "json", "limit": 1, "countrycodes": "hu"}
+    params = {"q": city_name, "format": "json", "limit": 1}
     r = requests.get(url, params=params, headers=HEADERS, timeout=30)
     r.raise_for_status()
     data = r.json()
@@ -385,6 +385,8 @@ function Run-Simulations {
 
     $odVarDir = Join-Path $SimDir "od_variants"
     New-Item -Path $odVarDir -ItemType Directory -Force | Out-Null
+    $logDir = Join-Path $SimDir "logs"
+    New-Item -Path $logDir -ItemType Directory -Force | Out-Null
 
     Write-Info "Creating OD matrix variants..."
     $template = Get-Content -Path "private_traffic.od" -Raw
@@ -397,25 +399,45 @@ function Run-Simulations {
     if (-not (Test-Path $NetFile)) { Write-Err "Network file not found: $NetFile"; throw "net file missing" }
 
     $jobs = @()
+    $hadFailures = $false
 
     # Baseline jobs (public transport only, no private traffic)
     for ($sim=1; $sim -le $SIMS_PER_VALUE; $sim++) {
         $SEED = $BASE_SEED + $sim
         $baselineStop = Join-Path $SimDir ("stop_events_baseline_${sim}.xml")
         if (Test-Path $baselineStop) {
-            Write-Warn ("Baseline already exists, skipping: {0}" -f $baselineStop)
-            continue
+            $validBase = $true
+            try { [xml](Get-Content -LiteralPath $baselineStop -Raw) | Out-Null } catch { $validBase = $false }
+            if ($validBase -and (Get-Item $baselineStop).Length -gt 500) {
+                Write-Warn ("Baseline already exists and is valid, skipping: {0}" -f $baselineStop)
+                continue
+            } else {
+                Write-Warn ("Existing baseline is missing/invalid, regenerating: {0}" -f $baselineStop)
+                try { Remove-Item -LiteralPath $baselineStop -Force -ErrorAction Stop } catch {}
+            }
         }
         $job = Start-Job -ScriptBlock {
-            param($sim,$SEED,$CITY_NAME,$NetFile,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$baselineStop)
+            param($sim,$SEED,$CITY_NAME,$NetFile,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$baselineStop,$logDir)
             $ErrorActionPreference = 'Continue'
             Set-Location $SimDir
+            if (-not (Test-Path $NetFile)) { throw "net file missing in job" }
+            if (-not (Test-Path $GtfsVtypes)) { throw "pt_vtypes missing" }
+            if (-not (Test-Path $GtfsAdd)) { throw "gtfs additional missing" }
+            if (-not (Test-Path $GtfsRou)) { throw "gtfs routes missing" }
+            $sumoLog = Join-Path $logDir ("baseline_${sim}.log")
+            $baselineStopTmp = "$baselineStop.tmp"
+            if (Test-Path $baselineStopTmp) { try { Remove-Item -LiteralPath $baselineStopTmp -Force -ErrorAction Stop } catch {} }
             Write-Host "[INFO] Starting baseline simulation for sim=$sim, seed=$SEED" -ForegroundColor Cyan
             sumo -n "$NetFile" --additional "$GtfsVtypes,$GtfsAdd" --routes "$GtfsRou" `
-                 --begin 21600 --end 36000 --seed $SEED --stop-output "$baselineStop" --ignore-route-errors 2>&1 | Write-Host
+                 --begin 21600 --end 39600 --seed $SEED --stop-output "$baselineStopTmp" --ignore-route-errors `
+                 --log "$sumoLog" 2>&1 | Write-Host
             if ($LASTEXITCODE -ne 0) { throw "sumo baseline failed for sim=$sim" }
+            # Validate stop XML
+            if (-not (Test-Path $baselineStopTmp)) { throw "baseline stop file missing" }
+            try { [xml](Get-Content -LiteralPath $baselineStopTmp -Raw) | Out-Null } catch { throw "baseline stop xml invalid" }
+            try { Move-Item -LiteralPath $baselineStopTmp -Destination $baselineStop -Force } catch { throw "failed to finalize baseline stop file" }
             Write-Host "[SUCCESS] Baseline completed: sim=$sim" -ForegroundColor Green
-        } -ArgumentList $sim,$SEED,$CITY_NAME,$NetFile,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$baselineStop
+        } -ArgumentList $sim,$SEED,$CITY_NAME,$NetFile,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$baselineStop,$logDir
 
         $jobs += $job
         if ($jobs.Count -ge $MAX_JOBS) {
@@ -423,7 +445,7 @@ function Run-Simulations {
             $done = @($done)
             foreach ($j in $done) {
                 Receive-Job $j -ErrorAction Continue | Out-Host
-                if ($j.State -ne 'Completed') { Stop-Job $jobs | Out-Null; throw "A simulation job failed." }
+                if ($j.State -ne 'Completed') { $hadFailures = $true }
                 Remove-Job $j
                 $jobs = @($jobs | Where-Object { $_.Id -ne $j.Id })
             }
@@ -434,44 +456,89 @@ function Run-Simulations {
             $SEED = $BASE_SEED + $sim + $value
             $stopOutput = Join-Path $SimDir ("stop_events_${value}_${sim}.xml")
             $simOutput  = Join-Path $SimDir ("4_${value}_${sim}_${CITY_NAME}_sim_output.xml")
+            $simOk = $false; $stopOk = $false
             if (Test-Path $simOutput) {
-                Write-Warn ("Sim output already exists, skipping: {0}" -f $simOutput)
+                try { [xml](Get-Content -LiteralPath $simOutput -Raw) | Out-Null; if ((Get-Item $simOutput).Length -gt 1000) { $simOk = $true } } catch {}
+                if (-not $simOk) { try { Remove-Item -LiteralPath $simOutput -Force -ErrorAction Stop } catch {} }
+            }
+            if (Test-Path $stopOutput) {
+                try { [xml](Get-Content -LiteralPath $stopOutput -Raw) | Out-Null; if ((Get-Item $stopOutput).Length -gt 200) { $stopOk = $true } } catch {}
+                if (-not $stopOk) { try { Remove-Item -LiteralPath $stopOutput -Force -ErrorAction Stop } catch {} }
+            }
+            if ($simOk -and $stopOk) {
+                Write-Warn ("Outputs already exist and are valid, skipping: {0}; {1}" -f $simOutput,$stopOutput)
                 continue
             }
             $job = Start-Job -ScriptBlock {
-                param($value,$sim,$SEED,$CITY_NAME,$NetFile,$ZonesTaz,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$odVarDir,$stopOutput,$simOutput)
+                param($value,$sim,$SEED,$CITY_NAME,$NetFile,$ZonesTaz,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$odVarDir,$stopOutput,$simOutput,$logDir)
                 $ErrorActionPreference = 'Continue'
                 Set-Location $SimDir
                 $odFile = Join-Path $odVarDir ("private_${value}.od")
                 $tripFile = Join-Path $SimDir ("4_${value}_${sim}_private_for.trips.xml")
                 $routeFile = Join-Path $SimDir ("4_${value}_${sim}_private.rou.xml")
+                $tripFileTmp = "$tripFile.tmp"
+                $routeFileTmp = "$routeFile.tmp"
+                $stopOutputTmp = "$stopOutput.tmp"
+                $simOutputTmp  = "$simOutput.tmp"
+
+                foreach ($tmp in @($tripFileTmp,$routeFileTmp,$stopOutputTmp,$simOutputTmp)) {
+                    if (Test-Path $tmp) { try { Remove-Item -LiteralPath $tmp -Force -ErrorAction Stop } catch {} }
+                }
 
                 Write-Host "[INFO] Starting simulation #$sim for value=$value, seed=$SEED" -ForegroundColor Cyan
 
-                od2trips --taz-files "$ZonesTaz" --od-matrix-files "$odFile" --seed $SEED -o "$tripFile" 2>&1 | Write-Host
-                if ($LASTEXITCODE -ne 0) { throw "od2trips failed for value=$value sim=$sim" }
+                if (-not (Test-Path $ZonesTaz)) { throw "Zones TAZ missing" }
+                if (-not (Test-Path $odFile)) { throw "OD file missing: $odFile" }
+                if ((Test-Path $tripFile) -and ((Get-Item $tripFile).Length -gt 500)) {
+                    Write-Host "[INFO] Reusing existing trips: $tripFile" -ForegroundColor Yellow
+                } else {
+                    $odLog = Join-Path $logDir ("od2trips_${value}_${sim}.log")
+                    od2trips --taz-files "$ZonesTaz" --od-matrix-files "$odFile" --seed $SEED -o "$tripFileTmp" 2>&1 | Tee-Object -FilePath $odLog -Append | Write-Host
+                    if ($LASTEXITCODE -ne 0) { throw "od2trips failed for value=$value sim=$sim" }
+                    if (-not (Test-Path $tripFileTmp)) { throw "trip file missing" }
+                    if ((Get-Item $tripFileTmp).Length -lt 500) { throw "trip file too small" }
+                    try { Move-Item -LiteralPath $tripFileTmp -Destination $tripFile -Force } catch { throw "failed to finalize trip file" }
+                }
 
-                duarouter -n "$NetFile" --route-files "$tripFile" --seed $SEED -o "$routeFile" --ignore-errors --repair 2>&1 | Write-Host
-                if ($LASTEXITCODE -ne 0) { throw "duarouter failed for value=$value sim=$sim" }
+                if ((Test-Path $routeFile) -and ((Get-Item $routeFile).Length -gt 500)) {
+                    Write-Host "[INFO] Reusing existing routes: $routeFile" -ForegroundColor Yellow
+                } else {
+                    $duaLog = Join-Path $logDir ("duarouter_${value}_${sim}.log")
+                    duarouter -n "$NetFile" --route-files "$tripFile" --seed $SEED -o "$routeFileTmp" --ignore-errors --repair 2>&1 | Tee-Object -FilePath $duaLog -Append | Write-Host
+                    if ($LASTEXITCODE -ne 0) { throw "duarouter failed for value=$value sim=$sim" }
+                    if (-not (Test-Path $routeFileTmp)) { throw "route file missing" }
+                    if ((Get-Item $routeFileTmp).Length -lt 500) { throw "route file too small" }
+                    try { Move-Item -LiteralPath $routeFileTmp -Destination $routeFile -Force } catch { throw "failed to finalize route file" }
+                }
 
                 # Run mixed simulation: PT routes + private routes
+                $sumoLog = Join-Path $logDir ("sumo_${value}_${sim}.log")
                 sumo -n "$NetFile" --additional "$GtfsVtypes,$GtfsAdd" --routes "$GtfsRou,$routeFile" `
-                     --begin 21600 --end 36000 --seed $SEED --tripinfo-output "$simOutput" --stop-output "$stopOutput" --ignore-route-errors 2>&1 | Write-Host
+                     --begin 21600 --end 39600 --seed $SEED --tripinfo-output "$simOutputTmp" --tripinfo-output.write-unfinished true `
+                     --stop-output "$stopOutputTmp" --ignore-route-errors --log "$sumoLog" 2>&1 | Write-Host
                 if ($LASTEXITCODE -ne 0) { throw "sumo failed for value=$value sim=$sim" }
+                # Validate outputs
+                if (-not (Test-Path $simOutputTmp)) { throw "sim output missing" }
+                if ((Get-Item $simOutputTmp).Length -lt 1000) { throw "sim output too small" }
+                try { [xml](Get-Content -LiteralPath $simOutputTmp -Raw) | Out-Null } catch { throw "sim output xml invalid" }
+                if (-not (Test-Path $stopOutputTmp)) { throw "stop output missing" }
+                try { [xml](Get-Content -LiteralPath $stopOutputTmp -Raw) | Out-Null } catch { throw "stop output xml invalid" }
+                try { Move-Item -LiteralPath $simOutputTmp -Destination $simOutput -Force } catch { throw "failed to finalize sim output" }
+                try { Move-Item -LiteralPath $stopOutputTmp -Destination $stopOutput -Force } catch { throw "failed to finalize stop output" }
 
                 Write-Host "[SUCCESS] Completed: value=$value sim=$sim" -ForegroundColor Green
-            } -ArgumentList $value,$sim,$SEED,$CITY_NAME,$NetFile,$ZonesTaz,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$odVarDir,$stopOutput,$simOutput
+            } -ArgumentList $value,$sim,$SEED,$CITY_NAME,$NetFile,$ZonesTaz,$GtfsVtypes,$GtfsAdd,$GtfsRou,$SimDir,$odVarDir,$stopOutput,$simOutput,$logDir
 
             $jobs += $job
             if ($jobs.Count -ge $MAX_JOBS) {
                 $done = Wait-Job -Any $jobs
                 $done = @($done)
-                foreach ($j in $done) {
-                    Receive-Job $j -ErrorAction Continue | Out-Host
-                    if ($j.State -ne 'Completed') { Stop-Job $jobs | Out-Null; throw "A simulation job failed." }
-                    Remove-Job $j
-                    $jobs = @($jobs | Where-Object { $_.Id -ne $j.Id })
-                }
+            foreach ($j in $done) {
+                Receive-Job $j -ErrorAction Continue | Out-Host
+                if ($j.State -ne 'Completed') { $hadFailures = $true }
+                Remove-Job $j
+                $jobs = @($jobs | Where-Object { $_.Id -ne $j.Id })
+            }
             }
         }
     }
@@ -480,10 +547,12 @@ function Run-Simulations {
         $done = @($done)
         foreach ($j in $done) {
             Receive-Job $j -ErrorAction Continue | Out-Host
-            if ($j.State -ne 'Completed') { Stop-Job $jobs | Out-Null; throw "A simulation job failed." }
+            if ($j.State -ne 'Completed') { $hadFailures = $true }
             Remove-Job $j
             $jobs = @($jobs | Where-Object { $_.Id -ne $j.Id })
         }
+    }
+    if ($hadFailures) { throw "A simulation job failed." }
     }
     Write-Success "All simulations for all values completed!"
 
@@ -513,7 +582,7 @@ function Run-Simulations {
     } catch {
         Write-Warn ("Failed to export Excel: {0}" -f $_.Exception.Message)
     }
-}
+
 
 function Main {
     Write-Host "========================================="
