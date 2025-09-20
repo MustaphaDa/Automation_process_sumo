@@ -102,8 +102,8 @@ function Load-Config {
     if ($null -ne $cfg.simDate) { $Global:SIM_DATE = [string]$cfg.simDate }
     if ($null -ne $cfg.transportModes) { $Global:TRANSPORT_MODES = [string]$cfg.transportModes }
     if ($null -ne $cfg.maxJobs) { $Global:MAX_JOBS = [int]$cfg.maxJobs }
-    if ($null -ne $cfg.centerX) { $Global:CENTER_X = [double]$cfg.centerX }
-    if ($null -ne $cfg.centerY) { $Global:CENTER_Y = [double]$cfg.centerY }
+    if ($null -ne $cfg.PSObject.Properties['centerX']) { $Global:CENTER_X = [double]$cfg.centerX }
+    if ($null -ne $cfg.PSObject.Properties['centerY']) { $Global:CENTER_Y = [double]$cfg.centerY }
     if ($null -ne $cfg.simsPerValue) { $Global:SIMS_PER_VALUE = [int]$cfg.simsPerValue }
 
     Write-Success "Loaded configuration from config.json"
@@ -112,6 +112,10 @@ function Load-Config {
 
 function Get-UserInput {
     Write-Info "Getting user configuration..."
+
+    # Initialize global variables
+    $Global:CENTER_X = $null
+    $Global:CENTER_Y = $null
 
     $cfgLoaded = Load-Config
 
@@ -148,15 +152,8 @@ function Get-UserInput {
         if ([string]::IsNullOrWhiteSpace($tmp)) { $Global:MAX_JOBS = [Environment]::ProcessorCount } else { $Global:MAX_JOBS = [int]$tmp }
     } else { Write-Info ("Max jobs: {0}" -f $Global:MAX_JOBS) }
 
-    if ($null -eq $Global:CENTER_X) {
-        do { $cx = Read-Host "Enter CENTER_X coordinate (e.g., 4153868.14)" } while (-not ($cx -match '^[0-9]+(\.[0-9]+)?$'))
-        $Global:CENTER_X = [double]$cx
-    } else { Write-Info ("CENTER_X: {0}" -f $Global:CENTER_X) }
-
-    if ($null -eq $Global:CENTER_Y) {
-        do { $cy = Read-Host "Enter CENTER_Y coordinate (e.g., 18753391.265)" } while (-not ($cy -match '^[0-9]+(\.[0-9]+)?$'))
-        $Global:CENTER_Y = [double]$cy
-    } else { Write-Info ("CENTER_Y: {0}" -f $Global:CENTER_Y) }
+    # Center coordinates will be automatically detected from network file
+    Write-Info "Center coordinates will be automatically detected from network file"
 
     if ($null -eq $Global:SIMS_PER_VALUE -or $Global:SIMS_PER_VALUE -le 0) {
         $tmp2 = Read-Host "Enter number of simulations per value (default: 10)"
@@ -319,6 +316,43 @@ function Run-Workflow {
                    --junctions.join | Write-Host
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $netFile)) { Write-Err "Failed to create network file: $netFile"; throw "netconvert failed" }
         Write-Success "Network file created successfully"
+    }
+
+    # Step 2.5: Get center coordinates automatically
+    if ($null -eq $Global:CENTER_X -or $null -eq $Global:CENTER_Y) {
+        Write-Info "Getting center coordinates automatically from network file..."
+        $getCenterScript = Join-Path (Get-Location) "get_center.py"
+        if (Test-Path $getCenterScript) {
+            Push-Location $OUT_NET
+            try {
+                $netFileName = Split-Path $netFile -Leaf
+                $centerOutput = & $pythonCmd $getCenterScript $netFileName 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    # Parse output like "Suggested center: (6357.804047432355, 6651.46203987553)"
+                    if ($centerOutput -match "Suggested center: \(([0-9.-]+), ([0-9.-]+)\)") {
+                        $Global:CENTER_X = [double]$matches[1]
+                        $Global:CENTER_Y = [double]$matches[2]
+                        Write-Success ("Center coordinates obtained: X={0}, Y={1}" -f $Global:CENTER_X, $Global:CENTER_Y)
+                    } else {
+                        Write-Warn "Could not parse center coordinates from output: $centerOutput"
+                        throw "Failed to parse center coordinates"
+                    }
+                } else {
+                    Write-Warn "get_center.py failed with exit code: $LASTEXITCODE"
+                    throw "get_center.py failed"
+                }
+            } catch {
+                Write-Err "Failed to get center coordinates automatically: $($_.Exception.Message)"
+                throw "Center coordinates required"
+            } finally {
+                Pop-Location
+            }
+        } else {
+            Write-Err "get_center.py script not found at: $getCenterScript"
+            throw "get_center.py missing"
+        }
+    } else {
+        Write-Info ("Using center coordinates from config: X={0}, Y={1}" -f $Global:CENTER_X, $Global:CENTER_Y)
     }
 
     # Step 3: Create zones
@@ -553,7 +587,7 @@ function Run-Simulations {
         }
     }
     if ($hadFailures) { throw "A simulation job failed." }
-    }
+    
     Write-Success "All simulations for all values completed!"
 
     # Build Excel analysis automatically
@@ -576,11 +610,30 @@ function Run-Simulations {
         & $PythonCmd $exportScript --simdir "$SimDir" --sims $SIMS_PER_VALUE --out "$excelPath" | Write-Host
         if ($LASTEXITCODE -eq 0 -and (Test-Path $excelPath)) {
             Write-Success "Delay analysis Excel generated"
+            # Auto-run plotting script to produce figures
+            $plotScript = Join-Path (Get-Location) "plot_pt_delay.py"
+            if (Test-Path $plotScript) {
+                $outPng   = Join-Path $OUT_ANALYSIS "pt_delay.png"
+                $outHeat  = Join-Path $OUT_ANALYSIS "pt_delay_heat.png"
+                $outFan   = Join-Path $OUT_ANALYSIS "pt_delay_fan.png"
+                $outBox   = Join-Path $OUT_ANALYSIS "pt_delay_box.png"
+                $outRange = Join-Path $OUT_ANALYSIS "pt_delay_range.png"
+                Write-Info ("Generating plots to: {0}" -f $outPng)
+                & $PythonCmd $plotScript --excel "$excelPath" --out "$outPng" --out-heat "$outHeat" --out-fan "$outFan" --out-box "$outBox" --out-range "$outRange" | Write-Host
+                if ($LASTEXITCODE -eq 0 -and (Test-Path $outPng)) {
+                    Write-Success "Plots generated"
+                } else {
+                    Write-Warn ("Plotting failed (exit={0})." -f $LASTEXITCODE)
+                }
+            } else {
+                Write-Warn "plot_pt_delay.py not found; skipping plotting step"
+            }
         } else {
             Write-Err ("Export failed (exit={0})." -f $LASTEXITCODE)
         }
     } catch {
         Write-Warn ("Failed to export Excel: {0}" -f $_.Exception.Message)
+    }
     }
 
 
