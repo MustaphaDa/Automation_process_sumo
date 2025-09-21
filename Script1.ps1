@@ -548,7 +548,7 @@ function Run-Simulations {
                 # Run mixed simulation: PT routes + private routes
                 $sumoLog = Join-Path $logDir ("sumo_${value}_${sim}.log")
                 sumo -n "$NetFile" --additional "$GtfsVtypes,$GtfsAdd" --routes "$GtfsRou,$routeFile" `
-                     --begin 21600 --end 39600 --seed $SEED --tripinfo-output "$simOutputTmp" --tripinfo-output.write-unfinished true `
+                     --begin 21600 --end 36000 --seed $SEED --tripinfo-output "$simOutputTmp" --tripinfo-output.write-unfinished true `
                      --stop-output "$stopOutputTmp" --ignore-route-errors --log "$sumoLog" 2>&1 | Write-Host
                 if ($LASTEXITCODE -ne 0) { throw "sumo failed for value=$value sim=$sim" }
                 # Validate outputs

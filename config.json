@@ -1,10 +1,8 @@
 {
-    "cityName": "Pécs",
-    "gtfsPath": "gtfs_pea.zip",
-    "simDate": "20210916",
+    "cityName": "Brest",
+    "gtfsPath": "gtfs_brest.zip",
+    "simDate": "20211210",
     "transportModes": "bus",
     "maxJobs": 7,
-    "centerX": 9619.87,
-    "centerY": 10540.2,
     "simsPerValue": 10
   }
